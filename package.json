@@ -1,6 +1,6 @@
 {
   "name": "@41px/mcp-xmind",
-  "version": "0.1.1",
+  "version": "1.1.0",
   "description": "MCP server for XMind",
   "license": "MIT",
   "author": "Alexandre Peyroux <alex@fmap.it>",
