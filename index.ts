@@ -60,6 +60,7 @@ interface XMindNode {
     callouts?: {
         title: string;
     }[];
+    relationships?: XMindRelationship[];
 }
 
 interface XMindTopic {
@@ -85,6 +86,13 @@ interface XMindTopic {
     };
     href?: string;
     labels?: string[];
+}
+
+interface XMindRelationship {
+    id: string;
+    end1Id: string;
+    end2Id: string;
+    title?: string;
 }
 
 // Class XMindParser
@@ -120,8 +128,17 @@ class XMindParser {
     private parseContentJson(jsonContent: string): Promise<XMindNode[]> {
         try {
             const content = JSON.parse(jsonContent);
-            const allNodes = content.map((sheet: { rootTopic: XMindTopic; title?: string }) => {
-                return this.processNode(sheet.rootTopic, sheet.title || "Untitled Map");
+            const allNodes = content.map((sheet: { 
+                rootTopic: XMindTopic; 
+                title?: string;
+                relationships?: XMindRelationship[];
+            }) => {
+                const rootNode = this.processNode(sheet.rootTopic, sheet.title || "Untitled Map");
+                // Ajouter les relations au nœud racine
+                if (sheet.relationships) {
+                    rootNode.relationships = sheet.relationships;
+                }
+                return rootNode;
             });
             return Promise.resolve(allNodes);
         } catch (error) {
@@ -180,68 +197,8 @@ function getNodePath(node: XMindNode, parents: string[] = []): string {
     return parents.length > 0 ? `${parents.join(' > ')} > ${node.title}` : node.title;
 }
 
-interface TodoTask {
-    path: string;
-    sheet: string;
-    title: string;
-    status: 'todo' | 'done';
-    context?: {
-        children: {
-            title: string;
-            subChildren?: string[];
-        }[];
-    };
-    notes?: {
-        content?: string;
-    };
-    labels?: string[];
-}
-
-function findTodoTasks(node: XMindNode, parents: string[] = []): TodoTask[] {
-    const todos: TodoTask[] = [];
-
-    if (node.taskStatus) {
-        const task: TodoTask = {
-            path: getNodePath(node, parents),
-            sheet: node.sheetTitle || 'Untitled Map',
-            title: node.title,
-            status: node.taskStatus
-        };
-
-        // Add notes, callouts and labels
-        if (node.notes) task.notes = node.notes;
-        if (node.labels) task.labels = node.labels;
-
-        // Add child nodes as context
-        if (node.children && node.children.length > 0) {
-            task.context = {
-                children: node.children.map(child => ({
-                    title: child.title,
-                    subChildren: child.children?.map(sc => sc.title)
-                }))
-            };
-        }
-
-        todos.push(task);
-    }
-
-    // Recursive search in children only (callouts are now part of notes)
-    if (node.children) {
-        const currentPath = [...parents, node.title];
-        node.children.forEach(child => {
-            todos.push(...findTodoTasks(child, currentPath));
-        });
-    }
-
-    return todos;
-}
-
 // Schema definitions
 const ReadXMindArgsSchema = z.object({
-    path: z.string(),
-});
-
-const GetTodoTasksArgsSchema = z.object({
     path: z.string(),
 });
 
@@ -272,8 +229,9 @@ const ExtractNodeByIdArgsSchema = z.object({
 const SearchNodesArgsSchema = z.object({
     path: z.string(),
     query: z.string(),
-    searchIn: z.array(z.enum(['title', 'notes', 'labels', 'callouts'])).optional(),
+    searchIn: z.array(z.enum(['title', 'notes', 'labels', 'callouts', 'tasks'])).optional(),
     caseSensitive: z.boolean().optional(),
+    taskStatus: z.enum(['todo', 'done']).optional(), // Ajout du filtre de statut de tâche
 });
 
 interface MultipleXMindResult {
@@ -458,6 +416,7 @@ interface NodeMatch {
     callouts?: {
         title: string;
     }[];
+    taskStatus?: 'todo' | 'done';
 }
 
 interface SearchResult {
@@ -473,13 +432,14 @@ function searchNodes(
     query: string,
     options: {
         searchIn?: string[],
-        caseSensitive?: boolean
+        caseSensitive?: boolean,
+        taskStatus?: 'todo' | 'done'
     } = {},
     parents: string[] = []
 ): NodeMatch[] {
     const matches: NodeMatch[] = [];
     const searchQuery = options.caseSensitive ? query : query.toLowerCase();
-    const searchFields = options.searchIn || ['title', 'notes', 'labels', 'callouts'];
+    const searchFields = options.searchIn || ['title', 'notes', 'labels', 'callouts', 'tasks'];
 
     const matchedIn: string[] = [];
 
@@ -489,6 +449,14 @@ function searchNodes(
         const searchIn = options.caseSensitive ? text : text.toLowerCase();
         return searchIn.includes(searchQuery);
     };
+
+    // Vérification du statut de tâche si spécifié
+    if (options.taskStatus && node.taskStatus) {
+        if (node.taskStatus !== options.taskStatus) {
+            // Si le statut ne correspond pas, ignorer ce nœud
+            return [];
+        }
+    }
 
     // Vérifier chaque champ configuré
     if (searchFields.includes('title') && matchesText(node.title)) {
@@ -503,9 +471,15 @@ function searchNodes(
     if (searchFields.includes('callouts') && node.callouts?.some(callout => matchesText(callout.title))) {
         matchedIn.push('callouts');
     }
+    if (searchFields.includes('tasks') && node.taskStatus) {
+        matchedIn.push('tasks');
+    }
 
-    // Si on a trouvé des correspondances, ajouter ce nœud
-    if (matchedIn.length > 0 && node.id) {  // Vérifier que l'ID existe
+    // Si on a trouvé des correspondances ou si c'est une tâche correspondante, ajouter ce nœud
+    const shouldIncludeNode = matchedIn.length > 0 || 
+        (options.taskStatus && node.taskStatus === options.taskStatus);
+
+    if (shouldIncludeNode && node.id) {
         matches.push({
             id: node.id,
             title: node.title,
@@ -514,7 +488,8 @@ function searchNodes(
             matchedIn,
             notes: node.notes?.content,
             labels: node.labels,
-            callouts: node.callouts
+            callouts: node.callouts,
+            taskStatus: node.taskStatus // Ajout du statut de tâche dans les résultats
         });
     }
 
@@ -633,32 +608,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 name: "read_xmind",
                 description: `Parse and analyze XMind files with multiple capabilities:
                 - Extract complete mind map structure in JSON format
-                - Generate text or markdown summaries of the entire map or specific nodes
-                - Search for specific content using keywords or regular expressions
-                - Extract relationships between nodes
+                - Include all relationships between nodes with their IDs and titles
+                - Extract callouts attached to topics
+                - Generate text or markdown summaries
+                - Search for specific content
                 - Get hierarchical path to any node
                 - Filter content by labels, task status, or node depth
                 - Extract all URLs and external references
-                - Generate outline view of the mind map
-                - Count nodes, tasks, and get map statistics
+                - Analyze relationships and connections between topics
                 Input: File path to .xmind file
-                Output: JSON structure or formatted text based on query parameters`,
+                Output: JSON structure containing nodes, relationships, and callouts`,
                 inputSchema: zodToJsonSchema(ReadXMindArgsSchema),
-            },
-            {
-                name: "get_todo_tasks",
-                description: `Advanced task management and analysis tool for XMind files:
-                - Extract all tasks marked as TODO with their full context path
-                - Group tasks by priority, labels, or categories
-                - Find dependencies between tasks
-                - Calculate task completion statistics
-                - Identify task bottlenecks in projects
-                - Extract deadlines and timeline information
-                - Generate task reports in various formats
-                - Track task status changes
-                Input: File path to .xmind file
-                Output: Structured list of tasks with contextual information`,
-                inputSchema: zodToJsonSchema(GetTodoTasksArgsSchema),
             },
             {
                 name: "list_xmind_directory",
@@ -747,20 +707,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "search_nodes",
                 description: `Advanced node search with multiple criteria:
-                - Search through titles, notes, and labels
+                - Search through titles, notes, labels, callouts and tasks
+                - Filter by task status (todo/done)
+                - Find nodes by their relationships
                 - Configure which fields to search in
                 - Case-sensitive or insensitive search
-                - Get full context including path and sheet
+                - Get full context including task status
                 - Returns all matching nodes with their IDs
-                - Includes match location information
-                Note: Use "extract_node" with the found path to get detailed node content and full context
+                - Includes relationship information and task status
                 Input: {
                     path: Path to .xmind file,
                     query: Search text,
-                    searchIn: Array of fields to search in ['title', 'notes', 'labels', 'callouts'],
+                    searchIn: Array of fields to search in ['title', 'notes', 'labels', 'callouts', 'tasks'],
+                    taskStatus: 'todo' | 'done' (optional),
                     caseSensitive: Boolean (optional)
                 }
-                Output: Detailed search results with context`,
+                Output: Detailed search results with task status and context`,
                 inputSchema: zodToJsonSchema(SearchNodesArgsSchema),
             },
         ],
@@ -784,22 +746,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const mindmap = await parser.parse();
                 return {
                     content: [{ type: "text", text: JSON.stringify(mindmap, null, 2) }],
-                };
-            }
-
-            case "get_todo_tasks": {
-                const parsed = GetTodoTasksArgsSchema.safeParse(args);
-                if (!parsed.success) {
-                    throw new Error(`Invalid arguments for get_todo_tasks: ${parsed.error}`);
-                }
-                if (!isPathAllowed(parsed.data.path)) {
-                    throw new Error(`Access denied: ${parsed.data.path} is not in an allowed directory`);
-                }
-                const parser = new XMindParser(parsed.data.path);
-                const mindmap = await parser.parse();
-                const todos = mindmap.flatMap(node => findTodoTasks(node, []));
-                return {
-                    content: [{ type: "text", text: JSON.stringify(todos, null, 2) }],
                 };
             }
 
@@ -906,7 +852,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const matches: NodeMatch[] = mindmap.flatMap(sheet =>
                     searchNodes(sheet, parsed.data.query, {
                         searchIn: parsed.data.searchIn,
-                        caseSensitive: parsed.data.caseSensitive
+                        caseSensitive: parsed.data.caseSensitive,
+                        taskStatus: parsed.data.taskStatus
                     })
                 );
 
@@ -914,7 +861,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     query: parsed.data.query,
                     matches,
                     totalMatches: matches.length,
-                    searchedIn: parsed.data.searchIn || ['title', 'notes', 'labels']
+                    searchedIn: parsed.data.searchIn || ['title', 'notes', 'labels', 'callouts', 'tasks']
                 };
 
                 return {
