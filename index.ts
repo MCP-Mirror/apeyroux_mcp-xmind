@@ -3,9 +3,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ToolSchema,
+    CallToolRequestSchema,
+    ListToolsRequestSchema,
+    ToolSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import fs from "fs/promises";
 import path from "path";
@@ -17,28 +17,34 @@ import AdmZip from 'adm-zip';
 // Command line argument parsing
 const args = process.argv.slice(2);
 if (args.length === 0) {
-  console.error("Usage: mcp-server-xmind <allowed-directory> [additional-directories...]");
-  process.exit(1);
+    console.error("Usage: mcp-server-xmind <allowed-directory> [additional-directories...]");
+    process.exit(1);
 }
 
 // Store allowed directories in normalized form
 const allowedDirectories = args.map(dir =>
-  path.normalize(path.resolve(dir)).toLowerCase()
+    path.normalize(path.resolve(dir)).toLowerCase()
 );
 
 // Validate that all directories exist and are accessible
 await Promise.all(args.map(async (dir) => {
-  try {
-    const stats = await fs.stat(dir);
-    if (!stats.isDirectory()) {
-      console.error(`Error: ${dir} is not a directory`);
-      process.exit(1);
+    try {
+        const stats = await fs.stat(dir);
+        if (!stats.isDirectory()) {
+            console.error(`Error: ${dir} is not a directory`);
+            process.exit(1);
+        }
+    } catch (error) {
+        console.error(`Error accessing directory ${dir}:`, error);
+        process.exit(1);
     }
-  } catch (error) {
-    console.error(`Error accessing directory ${dir}:`, error);
-    process.exit(1);
-  }
 }));
+
+// Ajouter après la définition des allowedDirectories
+function isPathAllowed(filePath: string): boolean {
+    const normalizedPath = path.normalize(path.resolve(filePath)).toLowerCase();
+    return allowedDirectories.some(dir => normalizedPath.startsWith(dir));
+}
 
 // XMind Interfaces
 interface XMindNode {
@@ -46,10 +52,15 @@ interface XMindNode {
     id?: string;
     children?: XMindNode[];
     taskStatus?: 'done' | 'todo';
-    notes?: string;
+    notes?: {
+        content?: string;
+    };
     href?: string;
     labels?: string[];
     sheetTitle?: string;
+    callouts?: {
+        title: string;
+    }[];
 }
 
 interface XMindTopic {
@@ -57,6 +68,7 @@ interface XMindTopic {
     title: string;
     children?: {
         attached: XMindTopic[];
+        callout?: XMindTopic[];
     };
     extensions?: Array<{
         provider: string;
@@ -66,6 +78,9 @@ interface XMindTopic {
     }>;
     notes?: {
         plain?: {
+            content: string;
+        };
+        realHTML?: {
             content: string;
         };
     };
@@ -78,7 +93,11 @@ class XMindParser {
     private filePath: string;
 
     constructor(filePath: string) {
-        this.filePath = path.resolve(filePath);
+        const resolvedPath = path.resolve(filePath);
+        if (!isPathAllowed(resolvedPath)) {
+            throw new Error(`Access denied: ${filePath} is not in an allowed directory`);
+        }
+        this.filePath = resolvedPath;
     }
 
     public async parse(): Promise<XMindNode[]> {
@@ -118,20 +137,28 @@ class XMindParser {
             sheetTitle: sheetTitle || "Untitled Map"
         };
 
-        if (node.href) {
-            processedNode.href = node.href;
+        // Handle links, labels and callouts
+        if (node.href) processedNode.href = node.href;
+        if (node.labels) processedNode.labels = node.labels;
+        if (node.children?.callout) {
+            processedNode.callouts = node.children.callout.map(callout => ({
+                title: callout.title
+            }));
         }
 
-        if (node.labels) {
-            processedNode.labels = node.labels;
-        }
-
+        // Handle notes and callouts
         if (node.notes?.plain?.content) {
-            processedNode.notes = node.notes.plain.content;
+            processedNode.notes = {};
+
+            // Process main note content
+            if (node.notes?.plain?.content) {
+                processedNode.notes.content = node.notes.plain.content;
+            }
         }
 
+        // Handle task status
         if (node.extensions) {
-            const taskExtension = node.extensions.find((ext) => 
+            const taskExtension = node.extensions.find((ext) =>
                 ext.provider === 'org.xmind.ui.task' && ext.content?.status
             );
             if (taskExtension) {
@@ -139,9 +166,10 @@ class XMindParser {
             }
         }
 
-        if (node.children && node.children.attached) {
-            processedNode.children = node.children.attached.map((childNode) => 
-                this.processNode(childNode, sheetTitle)
+        // Process regular children
+        if (node.children?.attached) {
+            processedNode.children = node.children.attached.map(child =>
+                this.processNode(child, sheetTitle)
             );
         }
 
@@ -164,13 +192,15 @@ interface TodoTask {
             subChildren?: string[];
         }[];
     };
-    notes?: string;
+    notes?: {
+        content?: string;
+    };
     labels?: string[];
 }
 
 function findTodoTasks(node: XMindNode, parents: string[] = []): TodoTask[] {
     const todos: TodoTask[] = [];
-    
+
     if (node.taskStatus) {
         const task: TodoTask = {
             path: getNodePath(node, parents),
@@ -179,43 +209,26 @@ function findTodoTasks(node: XMindNode, parents: string[] = []): TodoTask[] {
             status: node.taskStatus
         };
 
-        // Add optional properties if they exist
-        if (node.notes) {
-            task.notes = node.notes;
-        }
-        if (node.labels) {
-            task.labels = node.labels;
-        }
-        
+        // Add notes, callouts and labels
+        if (node.notes) task.notes = node.notes;
+        if (node.labels) task.labels = node.labels;
+
         // Add child nodes as context
         if (node.children && node.children.length > 0) {
             task.context = {
-                children: node.children.map(child => {
-                    const childInfo = {
-                        title: child.title
-                    };
-                    
-                    if (child.children && child.children.length > 0) {
-                        return {
-                            ...childInfo,
-                            subChildren: child.children.map(subChild => subChild.title)
-                        };
-                    }
-                    
-                    return childInfo;
-                })
+                children: node.children.map(child => ({
+                    title: child.title,
+                    subChildren: child.children?.map(sc => sc.title)
+                }))
             };
         }
 
         todos.push(task);
     }
 
-    // Recursive search in children
+    // Recursive search in children only (callouts are now part of notes)
     if (node.children) {
-        const currentPath = [...parents];
-        if (node.title) {
-            currentPath.push(node.title);
-        }
+        const currentPath = [...parents, node.title];
         node.children.forEach(child => {
             todos.push(...findTodoTasks(child, currentPath));
         });
@@ -260,7 +273,7 @@ const ExtractNodeByIdArgsSchema = z.object({
 const SearchNodesArgsSchema = z.object({
     path: z.string(),
     query: z.string(),
-    searchIn: z.array(z.enum(['title', 'notes', 'labels'])).optional(),
+    searchIn: z.array(z.enum(['title', 'notes', 'labels', 'callouts'])).optional(),
     caseSensitive: z.boolean().optional(),
 });
 
@@ -274,8 +287,16 @@ interface MultipleXMindResult {
 
 async function readMultipleXMindFiles(paths: string[]): Promise<MultipleXMindResult[]> {
     const results: MultipleXMindResult[] = [];
-    
+
     for (const filePath of paths) {
+        if (!isPathAllowed(filePath)) {
+            results.push({
+                filePath,
+                content: [],
+                error: `Access denied: ${filePath} is not in an allowed directory`
+            });
+            continue;
+        }
         try {
             const parser = new XMindParser(filePath);
             const content = await parser.parse();
@@ -288,14 +309,14 @@ async function readMultipleXMindFiles(paths: string[]): Promise<MultipleXMindRes
             });
         }
     }
-    
+
     return results;
 }
 
 // Function to list XMind files
 async function listXMindFiles(directory?: string): Promise<string[]> {
     const files: string[] = [];
-    const dirsToScan = directory 
+    const dirsToScan = directory
         ? [path.normalize(path.resolve(directory))]
         : allowedDirectories;
 
@@ -330,47 +351,66 @@ async function listXMindFiles(directory?: string): Promise<string[]> {
 }
 
 // Add before server setup
-async function searchXMindFiles(pattern: string, directory?: string): Promise<string[]> {
+async function searchXMindFiles(pattern: string): Promise<string[]> {
     const matches: string[] = [];
     const searchPattern = pattern.toLowerCase();
-    const dirsToSearch = directory 
-        ? [path.normalize(path.resolve(directory))]
-        : allowedDirectories;
 
-    for (const dir of dirsToSearch) {
-        // Vérifier si le répertoire est autorisé
-        const normalizedDir = dir.toLowerCase();
-        if (!allowedDirectories.some(allowed => normalizedDir.startsWith(allowed))) {
-            continue; // Ignorer les répertoires non autorisés
-        }
+    async function searchInDirectory(currentDir: string) {
+        try {
+            const entries = await fs.readdir(currentDir, { withFileTypes: true });
+            for (const entry of entries) {
+                const fullPath = path.join(currentDir, entry.name);
 
-        async function searchInDirectory(currentDir: string) {
-            try {
-                const entries = await fs.readdir(currentDir, { withFileTypes: true });
-                for (const entry of entries) {
-                    const fullPath = path.join(currentDir, entry.name);
-                    const itemName = entry.name.toLowerCase();
-
-                    // Check if name matches pattern
-                    if (itemName.includes(searchPattern)) {
-                        matches.push(fullPath);
-                    }
-
-                    // Recursively search in subdirectories
-                    if (entry.isDirectory()) {
+                if (entry.isDirectory()) {
+                    // Ne chercher dans les sous-répertoires que s'ils sont dans un répertoire autorisé
+                    const normalizedPath = path.normalize(fullPath).toLowerCase();
+                    if (allowedDirectories.some(allowed => normalizedPath.startsWith(allowed))) {
                         await searchInDirectory(fullPath);
                     }
-                }
-            } catch (error) {
-                console.error(`Warning: Error searching directory ${currentDir}:`, error);
-                // Continue searching other directories even if one fails
-            }
-        }
+                } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.xmind')) {
+                    // Vérifier si le motif correspond au nom du fichier ou au chemin
+                    const searchableText = [
+                        entry.name.toLowerCase(),
+                        path.basename(entry.name, '.xmind').toLowerCase(),
+                        fullPath.toLowerCase()
+                    ];
 
-        await searchInDirectory(dir);
+                    if (searchPattern === '' || // Si pas de pattern, retourner tous les fichiers XMind
+                        searchableText.some(text => text.includes(searchPattern))) {
+                        matches.push(fullPath);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error(`Warning: Error searching directory ${currentDir}:`, error);
+        }
     }
 
-    return matches;
+    // Lancer la recherche dans tous les répertoires autorisés
+    await Promise.all(allowedDirectories.map(dir => searchInDirectory(dir)));
+
+    // Trier les résultats par pertinence
+    return matches.sort((a, b) => {
+        const aName = path.basename(a).toLowerCase();
+        const bName = path.basename(b).toLowerCase();
+
+        // Donner la priorité aux correspondances exactes dans le nom du fichier
+        const aExactMatch = aName.startsWith(searchPattern);
+        const bExactMatch = bName.startsWith(searchPattern);
+
+        if (aExactMatch && !bExactMatch) return -1;
+        if (!aExactMatch && bExactMatch) return 1;
+
+        // Puis aux correspondances dans le nom du fichier
+        const aContains = aName.includes(searchPattern);
+        const bContains = bName.includes(searchPattern);
+
+        if (aContains && !bContains) return -1;
+        if (!aContains && bContains) return 1;
+
+        // Enfin, trier par ordre alphabétique
+        return aName.localeCompare(bName);
+    });
 }
 
 interface NodeSearchResult {
@@ -385,11 +425,11 @@ function findNodeByPath(node: XMindNode, searchPath: string[]): NodeSearchResult
     }
 
     const currentSearch = searchPath[0].toLowerCase();
-    
+
     if (!node.children) {
-        return { 
-            found: false, 
-            error: `Node "${node.title}" has no children, cannot find "${currentSearch}"` 
+        return {
+            found: false,
+            error: `Node "${node.title}" has no children, cannot find "${currentSearch}"`
         };
     }
 
@@ -398,9 +438,9 @@ function findNodeByPath(node: XMindNode, searchPath: string[]): NodeSearchResult
     );
 
     if (!matchingChild) {
-        return { 
-            found: false, 
-            error: `Could not find child "${currentSearch}" in node "${node.title}"` 
+        return {
+            found: false,
+            error: `Could not find child "${currentSearch}" in node "${node.title}"`
         };
     }
 
@@ -415,6 +455,9 @@ interface NodeMatch {
     matchedIn: string[];
     notes?: string;
     labels?: string[];
+    callouts?: {
+        title: string;
+    }[];
 }
 
 interface SearchResult {
@@ -426,22 +469,23 @@ interface SearchResult {
 
 // Ajouter la fonction de recherche de nœuds
 function searchNodes(
-    node: XMindNode, 
-    query: string, 
-    options: { 
-        searchIn?: string[], 
-        caseSensitive?: boolean 
+    node: XMindNode,
+    query: string,
+    options: {
+        searchIn?: string[],
+        caseSensitive?: boolean
     } = {},
     parents: string[] = []
 ): NodeMatch[] {
     const matches: NodeMatch[] = [];
     const searchQuery = options.caseSensitive ? query : query.toLowerCase();
-    const searchFields = options.searchIn || ['title', 'notes', 'labels'];
-    
+    const searchFields = options.searchIn || ['title', 'notes', 'labels', 'callouts'];
+
     const matchedIn: string[] = [];
 
-    // Fonction helper pour la recherche de texte
-    const matchesText = (text: string): boolean => {
+    // Fonction helper pour la recherche de texte sécurisée
+    const matchesText = (text: string | undefined): boolean => {
+        if (!text) return false;
         const searchIn = options.caseSensitive ? text : text.toLowerCase();
         return searchIn.includes(searchQuery);
     };
@@ -450,23 +494,27 @@ function searchNodes(
     if (searchFields.includes('title') && matchesText(node.title)) {
         matchedIn.push('title');
     }
-    if (searchFields.includes('notes') && node.notes && matchesText(node.notes)) {
+    if (searchFields.includes('notes') && node.notes?.content && matchesText(node.notes.content)) {
         matchedIn.push('notes');
     }
     if (searchFields.includes('labels') && node.labels?.some(label => matchesText(label))) {
         matchedIn.push('labels');
     }
+    if (searchFields.includes('callouts') && node.callouts?.some(callout => matchesText(callout.title))) {
+        matchedIn.push('callouts');
+    }
 
     // Si on a trouvé des correspondances, ajouter ce nœud
-    if (matchedIn.length > 0) {
+    if (matchedIn.length > 0 && node.id) {  // Vérifier que l'ID existe
         matches.push({
-            id: node.id!,
+            id: node.id,
             title: node.title,
             path: getNodePath(node, parents),
             sheet: node.sheetTitle || 'Untitled Map',
             matchedIn,
-            notes: node.notes,
-            labels: node.labels
+            notes: node.notes?.content,
+            labels: node.labels,
+            callouts: node.callouts
         });
     }
 
@@ -514,19 +562,19 @@ interface PathSearchResult {
 
 // Nouvelle fonction de recherche de nœuds par chemin approximatif
 function findNodesbyFuzzyPath(
-    node: XMindNode, 
-    searchQuery: string, 
+    node: XMindNode,
+    searchQuery: string,
     parents: string[] = [],
     threshold: number = 0.5
 ): PathSearchResult['nodes'] {
     const results: PathSearchResult['nodes'] = [];
     const currentPath = getNodePath(node, parents);
-    
+
     // Fonction helper pour calculer la pertinence
     function calculateRelevance(nodePath: string, query: string): number {
         const pathLower = nodePath.toLowerCase();
         const queryLower = query.toLowerCase();
-        
+
         // Score plus élevé pour une correspondance exacte
         if (pathLower.includes(queryLower)) {
             return 1.0;
@@ -535,8 +583,8 @@ function findNodesbyFuzzyPath(
         // Score basé sur les mots correspondants
         const pathWords = pathLower.split(/[\s>]+/);
         const queryWords = queryLower.split(/[\s>]+/);
-        
-        const matchingWords = queryWords.filter(word => 
+
+        const matchingWords = queryWords.filter(word =>
             pathWords.some(pathWord => pathWord.includes(word))
         );
 
@@ -709,7 +757,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 Input: {
                     path: Path to .xmind file,
                     query: Search text,
-                    searchIn: Array of fields to search in ['title', 'notes', 'labels'],
+                    searchIn: Array of fields to search in ['title', 'notes', 'labels', 'callouts'],
                     caseSensitive: Boolean (optional)
                 }
                 Output: Detailed search results with context`,
@@ -729,6 +777,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 if (!parsed.success) {
                     throw new Error(`Invalid arguments for read_xmind: ${parsed.error}`);
                 }
+                if (!isPathAllowed(parsed.data.path)) {
+                    throw new Error(`Access denied: ${parsed.data.path} is not in an allowed directory`);
+                }
                 const parser = new XMindParser(parsed.data.path);
                 const mindmap = await parser.parse();
                 return {
@@ -740,6 +791,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const parsed = GetTodoTasksArgsSchema.safeParse(args);
                 if (!parsed.success) {
                     throw new Error(`Invalid arguments for get_todo_tasks: ${parsed.error}`);
+                }
+                if (!isPathAllowed(parsed.data.path)) {
+                    throw new Error(`Access denied: ${parsed.data.path} is not in an allowed directory`);
                 }
                 const parser = new XMindParser(parsed.data.path);
                 const mindmap = await parser.parse();
@@ -776,7 +830,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 if (!parsed.success) {
                     throw new Error(`Invalid arguments for search_xmind_files: ${parsed.error}`);
                 }
-                const matches = await searchXMindFiles(parsed.data.pattern, parsed.data.directory);
+                // Corriger l'appel pour n'utiliser que le pattern
+                const matches = await searchXMindFiles(parsed.data.pattern);
                 return {
                     content: [{ type: "text", text: matches.join('\n') }],
                 };
@@ -790,8 +845,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                 const parser = new XMindParser(parsed.data.path);
                 const mindmap = await parser.parse();
-                
-                const allMatches = mindmap.flatMap(sheet => 
+
+                const allMatches = mindmap.flatMap(sheet =>
                     findNodesbyFuzzyPath(sheet, parsed.data.searchQuery)
                 );
 
@@ -804,13 +859,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                 // Retourner le résultat avec les meilleurs matchs
                 return {
-                    content: [{ 
-                        type: "text", 
+                    content: [{
+                        type: "text",
                         text: JSON.stringify({
                             matches: allMatches.slice(0, 5), // Limiter aux 5 meilleurs résultats
                             totalMatches: allMatches.length,
                             query: parsed.data.searchQuery
-                        }, null, 2) 
+                        }, null, 2)
                     }],
                 };
             }
@@ -823,14 +878,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                 const parser = new XMindParser(parsed.data.path);
                 const mindmap = await parser.parse();
-                
+
                 for (const sheet of mindmap) {
                     const result = findNodeById(sheet, parsed.data.nodeId);
                     if (result.found && result.node) {
                         return {
-                            content: [{ 
-                                type: "text", 
-                                text: JSON.stringify(result.node, null, 2) 
+                            content: [{
+                                type: "text",
+                                text: JSON.stringify(result.node, null, 2)
                             }],
                         };
                     }
@@ -847,8 +902,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                 const parser = new XMindParser(parsed.data.path);
                 const mindmap = await parser.parse();
-                
-                const matches: NodeMatch[] = mindmap.flatMap(sheet => 
+
+                const matches: NodeMatch[] = mindmap.flatMap(sheet =>
                     searchNodes(sheet, parsed.data.query, {
                         searchIn: parsed.data.searchIn,
                         caseSensitive: parsed.data.caseSensitive
@@ -863,9 +918,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 };
 
                 return {
-                    content: [{ 
-                        type: "text", 
-                        text: JSON.stringify(result, null, 2) 
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify(result, null, 2)
                     }],
                 };
             }
