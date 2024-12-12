@@ -9,7 +9,6 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import fs from "fs/promises";
 import path from "path";
-import os from 'os';
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import AdmZip from 'adm-zip';
@@ -277,8 +276,6 @@ const SearchNodesArgsSchema = z.object({
     caseSensitive: z.boolean().optional(),
 });
 
-const ToolInputSchema = ToolSchema.shape.inputSchema;
-
 interface MultipleXMindResult {
     filePath: string;
     content: XMindNode[];
@@ -351,8 +348,24 @@ async function listXMindFiles(directory?: string): Promise<string[]> {
 }
 
 // Add before server setup
+async function searchInXMindContent(filePath: string, searchText: string): Promise<boolean> {
+    try {
+        const zip = new AdmZip(filePath);
+        const contentEntry = zip.getEntry("content.json");
+        if (!contentEntry) return false;
+
+        const content = zip.readAsText(contentEntry);
+        return content.toLowerCase().includes(searchText.toLowerCase());
+    } catch (error) {
+        console.error(`Error reading XMind file ${filePath}:`, error);
+        return false;
+    }
+}
+
+// Modification de la fonction searchXMindFiles
 async function searchXMindFiles(pattern: string): Promise<string[]> {
     const matches: string[] = [];
+    const contentMatches: string[] = [];
     const searchPattern = pattern.toLowerCase();
 
     async function searchInDirectory(currentDir: string) {
@@ -362,22 +375,25 @@ async function searchXMindFiles(pattern: string): Promise<string[]> {
                 const fullPath = path.join(currentDir, entry.name);
 
                 if (entry.isDirectory()) {
-                    // Ne chercher dans les sous-répertoires que s'ils sont dans un répertoire autorisé
                     const normalizedPath = path.normalize(fullPath).toLowerCase();
                     if (allowedDirectories.some(allowed => normalizedPath.startsWith(allowed))) {
                         await searchInDirectory(fullPath);
                     }
                 } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.xmind')) {
-                    // Vérifier si le motif correspond au nom du fichier ou au chemin
                     const searchableText = [
                         entry.name.toLowerCase(),
                         path.basename(entry.name, '.xmind').toLowerCase(),
                         fullPath.toLowerCase()
                     ];
 
-                    if (searchPattern === '' || // Si pas de pattern, retourner tous les fichiers XMind
+                    if (searchPattern === '' || 
                         searchableText.some(text => text.includes(searchPattern))) {
                         matches.push(fullPath);
+                    } else {
+                        // Si le pattern n'est pas trouvé dans le nom, chercher dans le contenu
+                        if (await searchInXMindContent(fullPath, searchPattern)) {
+                            contentMatches.push(fullPath);
+                        }
                     }
                 }
             }
@@ -386,31 +402,15 @@ async function searchXMindFiles(pattern: string): Promise<string[]> {
         }
     }
 
-    // Lancer la recherche dans tous les répertoires autorisés
     await Promise.all(allowedDirectories.map(dir => searchInDirectory(dir)));
 
-    // Trier les résultats par pertinence
-    return matches.sort((a, b) => {
-        const aName = path.basename(a).toLowerCase();
-        const bName = path.basename(b).toLowerCase();
+    // Combiner et trier les résultats
+    const allMatches = [
+        ...matches.sort((a, b) => path.basename(a).localeCompare(path.basename(b))),
+        ...contentMatches.sort((a, b) => path.basename(a).localeCompare(path.basename(b)))
+    ];
 
-        // Donner la priorité aux correspondances exactes dans le nom du fichier
-        const aExactMatch = aName.startsWith(searchPattern);
-        const bExactMatch = bName.startsWith(searchPattern);
-
-        if (aExactMatch && !bExactMatch) return -1;
-        if (!aExactMatch && bExactMatch) return 1;
-
-        // Puis aux correspondances dans le nom du fichier
-        const aContains = aName.includes(searchPattern);
-        const bContains = bName.includes(searchPattern);
-
-        if (aContains && !bContains) return -1;
-        if (!aContains && bContains) return 1;
-
-        // Enfin, trier par ordre alphabétique
-        return aName.localeCompare(bName);
-    });
+    return allMatches;
 }
 
 interface NodeSearchResult {
