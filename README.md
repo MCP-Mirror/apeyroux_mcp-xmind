@@ -127,7 +127,7 @@ Example `claude_desktop_config.json` for production using npmjs:
     "command": "npx",
     "args": [
       "-y",
-      "@apeyroux/mcp-xmind",
+      "@41px/mcp-xmind",
       "/Users/alex/XMind"
     ]
   }
