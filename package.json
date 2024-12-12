@@ -1,9 +1,9 @@
 {
-  "name": "@apeyroux/mcp-xmind",
+  "name": "@41px/mcp-xmind",
   "version": "0.1.0",
   "description": "MCP server for XMind",
   "license": "MIT",
-  "author": "Alexandre Peyroux",
+  "author": "Alexandre Peyroux <alex@fmap.it>",
   "type": "module",
   "bin": {
     "mcp-server-xmind": "dist/index.js"
