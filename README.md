@@ -1,4 +1,5 @@
 # MCP XMind Server
+[![smithery badge](https://smithery.ai/badge/@41px/mcp-xmind)](https://smithery.ai/server/@41px/mcp-xmind)
 
 A Model Context Protocol server for analyzing and querying XMind mind maps. This tool provides powerful capabilities for searching, extracting, and analyzing content from XMind files.
 
@@ -15,6 +16,15 @@ A Model Context Protocol server for analyzing and querying XMind mind maps. This
 
 ## Installation
 
+### Installing via Smithery
+
+To install XMind Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@41px/mcp-xmind):
+
+```bash
+npx -y @smithery/cli install @41px/mcp-xmind --client claude
+```
+
+### Manual Installation
 ```bash
 npm install @modelcontextprotocol/sdk adm-zip zod
 npm install --save-dev typescript @types/node
